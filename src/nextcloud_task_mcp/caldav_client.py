@@ -6,9 +6,10 @@ import logging
 import re
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, TypeVar
+from urllib.parse import unquote
 
 from caldav.collection import Calendar as DAVCalendar
 from caldav.collection import Principal as DAVPrincipal
@@ -17,6 +18,7 @@ from caldav.elements import dav
 from caldav.elements import ical as ical_elements
 from caldav.lib import error as caldav_error
 from icalendar import Calendar, Event, Todo
+from lxml import etree
 
 # caldav's top-level `caldav.DAVClient`/`DAVPrincipal`/`DAVCalendar`
 # are exposed via PEP 562 module-level lazy imports (see caldav/__init__.py),
@@ -40,6 +42,7 @@ from .errors import (
     ConnectionFailedError,
     EventNotFoundError,
     InvalidEventDataError,
+    InvalidIcsDataError,
     InvalidTaskDataError,
     TaskConflictError,
     TaskListAlreadyExistsError,
@@ -141,6 +144,226 @@ def _translate(exc: Exception) -> TaskMcpError:
         return ConnectionFailedError("A network error occurred talking to Nextcloud.")
     logger.warning("Unexpected error talking to Nextcloud", exc_info=exc)
     return TaskMcpError("An unexpected error occurred talking to Nextcloud.")
+
+
+# ----------------------------------------------------------------------
+# Nextcloud-specific DAV extensions (sharing, trashbin): these are not part
+# of any CalDAV RFC and have no API in the caldav library, so the methods
+# below build/parse raw XML and send it through `DAVClient.request` directly
+# (see `CalDavService._dav_request`). Namespaces per Nextcloud's sabre/dav
+# app (`OCA\DAV\DAV\Sharing\Plugin::NS_OWNCLOUD`/`NS_NEXTCLOUD`).
+# ----------------------------------------------------------------------
+
+_DAV_NS = "DAV:"
+_OC_NS = "http://owncloud.org/ns"
+_NC_NS = "http://nextcloud.com/ns"
+_CALDAV_NS = "urn:ietf:params:xml:ns:caldav"
+
+# Maps the {oc}invite-* child element found on an {oc}user share entry to
+# the German status vocabulary this server returns. Nextcloud's own server
+# currently always emits invite-accepted (shares are auto-accepted), but
+# other invite-* elements are part of the same sharing XML vocabulary (they
+# do appear for the closely related calendarserver.org CalDAV-sharing
+# elements some clients/servers use) - handled liberally rather than assumed
+# absent.
+_INVITE_STATUS_MAP = {
+    "invite-accepted": "akzeptiert",
+    "invite-declined": "abgelehnt",
+    "invite-noresponse": "ausstehend",
+    "invite-invalid": "ungueltig",
+    "invite-deleted": "geloescht",
+}
+
+# A trashbin object's resource name is "<numeric id>.ics" (see Nextcloud's
+# DeletedCalendarObjectsCollection::getChild, which 404s on anything else).
+_TRASH_ID_RE = re.compile(r"^\d+\.ics$")
+
+
+def _clark(namespace: str, tag: str) -> str:
+    """Build a Clark-notation tag ("{ns}tag") for lxml element construction/lookup."""
+    return f"{{{namespace}}}{tag}"
+
+
+def _local_name(tag: str) -> str:
+    """Strip the Clark-notation namespace off an lxml element tag."""
+    return tag.split("}", 1)[1] if "}" in tag else tag
+
+
+def _principal_href(empfaenger: str, gruppe: bool) -> str:
+    """Build the "principal:principals/<users|groups>/<id>" href Nextcloud's
+    sharing plugin expects in a `{oc}share` request's `{DAV:}href`."""
+    kind = "groups" if gruppe else "users"
+    return f"principal:principals/{kind}/{empfaenger}"
+
+
+def _parse_principal_href(href: str) -> tuple[str | None, str]:
+    """Reverse of `_principal_href`: recover (id, "benutzer"|"gruppe") from a
+    share entry's `{DAV:}href` text (as returned in a `{oc}invite` listing).
+
+    Parsed liberally: the leading "principal:" scheme prefix is optional, and
+    any href of the general shape ".../<users|groups>/<id>" is recognized
+    even without a "principals/" segment before it, so a server that renders
+    this slightly differently is still handled. Falls back to treating the
+    last path segment as a user id if the kind can't be determined.
+    """
+    remainder = href.strip()
+    if remainder.lower().startswith("principal:"):
+        remainder = remainder[len("principal:") :]
+    parts = [p for p in remainder.strip("/").split("/") if p]
+    if not parts:
+        return None, "benutzer"
+    if len(parts) >= 2 and parts[-2] in ("users", "groups"):
+        kind = "gruppe" if parts[-2] == "groups" else "benutzer"
+        return unquote(parts[-1]), kind
+    return unquote(parts[-1]), "benutzer"
+
+
+def _share_request_body(principal_href: str, *, remove: bool, read_write: bool) -> str:
+    """Build the `{oc}share` POST body to add/update or remove one sharee."""
+    root = etree.Element(_clark(_OC_NS, "share"), nsmap={"d": _DAV_NS, "o": _OC_NS})
+    if remove:
+        action = etree.SubElement(root, _clark(_OC_NS, "remove"))
+        etree.SubElement(action, _clark(_DAV_NS, "href")).text = principal_href
+    else:
+        action = etree.SubElement(root, _clark(_OC_NS, "set"))
+        etree.SubElement(action, _clark(_DAV_NS, "href")).text = principal_href
+        etree.SubElement(action, _clark(_OC_NS, "summary"))
+        if read_write:
+            etree.SubElement(action, _clark(_OC_NS, "read-write"))
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8").decode("utf-8")
+
+
+def _invite_propfind_body() -> str:
+    """Build a PROPFIND body requesting just the `{oc}invite` property."""
+    root = etree.Element(_clark(_DAV_NS, "propfind"), nsmap={"d": _DAV_NS, "o": _OC_NS})
+    prop = etree.SubElement(root, _clark(_DAV_NS, "prop"))
+    etree.SubElement(prop, _clark(_OC_NS, "invite"))
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8").decode("utf-8")
+
+
+def _trashbin_propfind_body() -> str:
+    """Build a PROPFIND body for listing trashbin objects (Nextcloud's
+    calendar-trashbin plugin, namespace `http://nextcloud.com/ns`)."""
+    root = etree.Element(
+        _clark(_DAV_NS, "propfind"), nsmap={"d": _DAV_NS, "c": _CALDAV_NS, "nc": _NC_NS}
+    )
+    prop = etree.SubElement(root, _clark(_DAV_NS, "prop"))
+    etree.SubElement(prop, _clark(_DAV_NS, "displayname"))
+    etree.SubElement(prop, _clark(_CALDAV_NS, "calendar-data"))
+    etree.SubElement(prop, _clark(_NC_NS, "deleted-at"))
+    etree.SubElement(prop, _clark(_NC_NS, "calendar-uri"))
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8").decode("utf-8")
+
+
+def _iter_multistatus_responses(
+    tree: Any,
+) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield (href, {Clark-tag: element}) for each `{DAV:}response` in a
+    multistatus tree, collecting only properties reported with a 200 OK
+    propstat (a property Nextcloud doesn't have for a given resource comes
+    back under a 404 propstat instead, which is silently skipped here).
+    """
+    if tree is None:
+        return
+    for response_el in tree.findall(_clark(_DAV_NS, "response")):
+        href_el = response_el.find(_clark(_DAV_NS, "href"))
+        if href_el is None or not href_el.text:
+            continue
+        props: dict[str, Any] = {}
+        for propstat_el in response_el.findall(_clark(_DAV_NS, "propstat")):
+            status_el = propstat_el.find(_clark(_DAV_NS, "status"))
+            if status_el is None or status_el.text is None or " 200 " not in f" {status_el.text} ":
+                continue
+            prop_el = propstat_el.find(_clark(_DAV_NS, "prop"))
+            if prop_el is None:
+                continue
+            for child in prop_el:
+                props[child.tag] = child
+        yield href_el.text, props
+
+
+def _parse_invite_response(tree: Any) -> list[dict[str, Any]]:
+    """Parse a `{oc}invite` PROPFIND response into share dicts."""
+    shares: list[dict[str, Any]] = []
+    for _, props in _iter_multistatus_responses(tree):
+        invite_el = props.get(_clark(_OC_NS, "invite"))
+        if invite_el is None:
+            continue
+        for user_el in invite_el:
+            if _local_name(user_el.tag) != "user":
+                continue  # skip {oc}organizer - that's the sharer, not a sharee
+            href_el = user_el.find(_clark(_DAV_NS, "href"))
+            if href_el is None or not href_el.text:
+                continue
+            empfaenger, typ = _parse_principal_href(href_el.text)
+            if not empfaenger:
+                continue
+            access_el = user_el.find(_clark(_OC_NS, "access"))
+            read_write = access_el is not None and any(
+                _local_name(child.tag) == "read-write" for child in access_el
+            )
+            status = "akzeptiert"
+            for child in user_el:
+                local = _local_name(child.tag)
+                if local.startswith("invite-"):
+                    status = _INVITE_STATUS_MAP.get(local, local[len("invite-") :])
+                    break
+            shares.append(
+                {
+                    "empfaenger": empfaenger,
+                    "typ": typ,
+                    "schreibzugriff": read_write,
+                    "status": status,
+                }
+            )
+    return shares
+
+
+def _parse_deleted_at(raw: str | None) -> str | None:
+    """Parse a `{nc}deleted-at` property value into an ISO timestamp.
+
+    Nextcloud's calendar-trashbin plugin has been observed to encode this as
+    a raw Unix epoch integer (tried first) as well as an ISO 8601 string
+    (`DateTimeInterface::ATOM`, e.g. from newer server versions) - both are
+    accepted; anything else parses to None rather than raising, since this is
+    a display-only field.
+    """
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromtimestamp(int(text), tz=timezone.utc).isoformat()
+    except (ValueError, OverflowError, OSError):
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).isoformat()
+    except ValueError:
+        return None
+
+
+def _derive_title_and_type(ics_text: str | None) -> tuple[str | None, str | None]:
+    """Best-effort SUMMARY/component-kind extraction from a trashbin item's
+    raw calendar-data, for `list_trash`'s "titel"/"typ" fields.
+
+    Returns (None, None) if `ics_text` is missing or unparseable - a trashbin
+    listing entry is still useful without a title.
+    """
+    if not ics_text or not ics_text.strip():
+        return None, None
+    try:
+        parsed = Calendar.from_ical(ics_text)
+    except Exception:
+        return None, None
+    for component in parsed.walk():
+        if component.name == "VEVENT":
+            summary = component.get("summary")
+            return (str(summary) if summary else None), "termin"
+        if component.name == "VTODO":
+            summary = component.get("summary")
+            return (str(summary) if summary else None), "aufgabe"
+    return None, None
 
 
 class CalDavService:
@@ -360,6 +583,64 @@ class CalDavService:
     def _with_calendar(self, list_name: str, fn: Callable[[DAVCalendar], _T]) -> _T:
         """Task-list flavour of `_with_collection`, kept for the VTODO call sites."""
         return self._with_collection(list_name, "VTODO", fn)
+
+    def _resolve_collection_any(self, name: str) -> DAVCalendar:
+        """Resolve `name` to a collection of either kind (task list or event calendar).
+
+        Used by the cross-cutting Nextcloud features below (sharing, ICS
+        export/import) that operate identically on both kinds. Tries the
+        VEVENT-supporting collections first, then VTODO; an ambiguous name
+        found within either kind is raised immediately - matching
+        `_resolve_collection`'s "don't guess" stance - rather than silently
+        falling through to try the other kind.
+        """
+        try:
+            return self._resolve_collection(name, "VEVENT")
+        except (CalendarNotFoundError, TaskListNotFoundError):
+            pass
+        try:
+            return self._resolve_collection(name, "VTODO")
+        except (CalendarNotFoundError, TaskListNotFoundError) as exc:
+            raise TaskMcpError(f"Calendar or task list '{name}' was not found.") from exc
+
+    def _dav_request(
+        self,
+        url: Any,
+        method: str,
+        body: str,
+        headers: dict[str, str],
+        *,
+        forbidden_message: str,
+    ) -> Any:
+        """Send a raw DAV request via the shared session, translating errors.
+
+        Nextcloud's sharing/trashbin extensions used below are outside plain
+        CalDAV and have no caldav-library API, so these go straight through
+        `DAVClient.request`. Its own auth-negotiation logic already turns any
+        HTTP 401/403 response into `caldav_error.AuthorizationError` before
+        this ever sees a response object (see `DAVClient._sync_request`) -
+        `_translate` would turn that into a generic "bad credentials"
+        message, which is misleading for a 403 that actually means "no
+        permission for this specific operation", so it's caught here and
+        replaced with the caller-supplied, operation-specific
+        `forbidden_message` instead. Any other response (including 404 and
+        other 4xx/5xx) comes back as a normal `DAVResponse` for the caller to
+        inspect via `.status`.
+        """
+        try:
+            return self._client.request(str(url), method, body, headers)
+        except caldav_error.AuthorizationError as exc:
+            raise TaskMcpError(forbidden_message) from exc
+        except TaskMcpError:
+            raise
+        except Exception as exc:
+            raise _translate(exc) from exc
+
+    def _trashbin_objects_url(self) -> Any:
+        return self._client.url.join(f"calendars/{self._username}/trashbin/objects/")
+
+    def _trashbin_restore_url(self) -> Any:
+        return self._client.url.join(f"calendars/{self._username}/trashbin/restore/")
 
     def list_task_lists(self) -> list[dict[str, str]]:
         """Return all VTODO-supporting calendars on the account as {"name", "url"} dicts.
@@ -1498,3 +1779,350 @@ class CalDavService:
 
         periods = event_mapping.extract_freebusy_periods(component)
         return event_mapping.merge_busy_intervals(periods)
+
+    # ------------------------------------------------------------------
+    # Calendar sharing (Nextcloud DAV extension - not part of any CalDAV
+    # RFC, so this only works against a real Nextcloud server)
+    # ------------------------------------------------------------------
+
+    def share_calendar(
+        self,
+        kalender_name: str,
+        empfaenger: str,
+        gruppe: bool = False,
+        schreibzugriff: bool = False,
+    ) -> dict[str, Any]:
+        """Share a task list or event calendar with a Nextcloud user or group.
+
+        Uses Nextcloud's own CalDAV sharing extension (POST `{DAV:}share` to
+        the collection's own URL) - this has no equivalent in any CalDAV RFC,
+        so it only works against a real Nextcloud server. Calling this again
+        for the same `empfaenger` updates their access level rather than
+        creating a duplicate share.
+        """
+        if not empfaenger or not empfaenger.strip():
+            raise TaskMcpError("empfaenger is required to share a calendar.")
+
+        with self._lock:
+            calendar = self._resolve_collection_any(kalender_name)
+            body = _share_request_body(
+                _principal_href(empfaenger, gruppe), remove=False, read_write=schreibzugriff
+            )
+            response = self._dav_request(
+                calendar.url,
+                "POST",
+                body,
+                {"Content-Type": "application/xml; charset=utf-8"},
+                forbidden_message=(
+                    f"Nextcloud denied sharing '{kalender_name}' with '{empfaenger}' "
+                    "(permission denied, or the sharing backend is disabled)."
+                ),
+            )
+            self._raise_for_share_response(response, kalender_name, empfaenger)
+
+        return {
+            "kalender_name": kalender_name,
+            "empfaenger": empfaenger,
+            "schreibzugriff": schreibzugriff,
+        }
+
+    def unshare_calendar(
+        self, kalender_name: str, empfaenger: str, gruppe: bool = False
+    ) -> None:
+        """Remove a user's or group's share of a task list or event calendar.
+
+        A no-op (not an error) if `empfaenger` doesn't currently have a share
+        of this calendar - Nextcloud's sharing plugin doesn't distinguish
+        "removed" from "wasn't shared" in its response.
+        """
+        if not empfaenger or not empfaenger.strip():
+            raise TaskMcpError("empfaenger is required to unshare a calendar.")
+
+        with self._lock:
+            calendar = self._resolve_collection_any(kalender_name)
+            body = _share_request_body(
+                _principal_href(empfaenger, gruppe), remove=True, read_write=False
+            )
+            response = self._dav_request(
+                calendar.url,
+                "POST",
+                body,
+                {"Content-Type": "application/xml; charset=utf-8"},
+                forbidden_message=(
+                    f"Nextcloud denied unsharing '{kalender_name}' from '{empfaenger}' "
+                    "(permission denied, or the sharing backend is disabled)."
+                ),
+            )
+            self._raise_for_share_response(response, kalender_name, empfaenger)
+
+    def _raise_for_share_response(self, response: Any, kalender_name: str, empfaenger: str) -> None:
+        if response.status in (200, 204, 207):
+            return
+        if response.status == 404:
+            raise TaskMcpError(
+                f"Nextcloud could not find user/group '{empfaenger}' to share "
+                f"'{kalender_name}' with."
+            )
+        if response.status == 400:
+            raise TaskMcpError(
+                f"Nextcloud rejected the sharing request for '{kalender_name}' as invalid "
+                f"(check that '{empfaenger}' is a valid user/group id)."
+            )
+        logger.warning(
+            "Unexpected sharing response %s for calendar %s", response.status, kalender_name
+        )
+        raise TaskMcpError(
+            f"Nextcloud rejected the sharing request for '{kalender_name}' "
+            f"(HTTP {response.status})."
+        )
+
+    def list_calendar_shares(self, kalender_name: str) -> list[dict[str, Any]]:
+        """List everyone a task list or event calendar is currently shared with.
+
+        Reads Nextcloud's `{oc}invite` DAV property (PROPFIND, Depth 0) -
+        like `share_calendar`, this only works against a real Nextcloud
+        server.
+        """
+        with self._lock:
+            calendar = self._resolve_collection_any(kalender_name)
+            response = self._dav_request(
+                calendar.url,
+                "PROPFIND",
+                _invite_propfind_body(),
+                {"Content-Type": "application/xml; charset=utf-8", "Depth": "0"},
+                forbidden_message=(
+                    f"Nextcloud denied reading the shares of '{kalender_name}' "
+                    "(permission denied)."
+                ),
+            )
+            if response.status not in (200, 207):
+                logger.warning(
+                    "Unexpected share-listing response %s for calendar %s",
+                    response.status,
+                    kalender_name,
+                )
+                raise TaskMcpError(
+                    f"Nextcloud returned an unexpected error listing the shares of "
+                    f"'{kalender_name}' (HTTP {response.status})."
+                )
+            return _parse_invite_response(response.tree)
+
+    # ------------------------------------------------------------------
+    # Trash bin (Nextcloud calendar-trashbin DAV plugin)
+    # ------------------------------------------------------------------
+
+    def list_trash(self) -> list[dict[str, Any]]:
+        """List deleted calendar objects (tasks/events) in Nextcloud's trash bin.
+
+        Reads Nextcloud's calendar-trashbin plugin (PROPFIND, Depth 1, on
+        `.../trashbin/objects/`) - a non-Nextcloud CalDAV server has no such
+        collection, which is reported as a clean "not available" error
+        rather than a raw 404/405.
+        """
+        with self._lock:
+            response = self._dav_request(
+                self._trashbin_objects_url(),
+                "PROPFIND",
+                _trashbin_propfind_body(),
+                {"Content-Type": "application/xml; charset=utf-8", "Depth": "1"},
+                forbidden_message="Nextcloud denied access to the trash bin (permission denied).",
+            )
+            if response.status in (404, 405):
+                raise TaskMcpError("The trash bin is not available on this server.")
+            if response.status not in (200, 207):
+                logger.warning("Unexpected trashbin listing response %s", response.status)
+                raise TaskMcpError(
+                    f"Nextcloud returned an unexpected error listing the trash bin "
+                    f"(HTTP {response.status})."
+                )
+
+            items: list[dict[str, Any]] = []
+            for href, props in _iter_multistatus_responses(response.tree):
+                name = unquote(href.rstrip("/").rsplit("/", 1)[-1])
+                if not _TRASH_ID_RE.match(name):
+                    # The `objects/` collection's own Depth-1 response entry,
+                    # or anything else that isn't a trashed calendar object.
+                    continue
+
+                deleted_el = props.get(_clark(_NC_NS, "deleted-at"))
+                calendar_uri_el = props.get(_clark(_NC_NS, "calendar-uri"))
+                calendar_data_el = props.get(_clark(_CALDAV_NS, "calendar-data"))
+                displayname_el = props.get(_clark(_DAV_NS, "displayname"))
+
+                titel, typ = _derive_title_and_type(
+                    calendar_data_el.text if calendar_data_el is not None else None
+                )
+                if titel is None and displayname_el is not None and displayname_el.text:
+                    titel = displayname_el.text.strip()
+
+                items.append(
+                    {
+                        "id": name,
+                        "titel": titel,
+                        "typ": typ,
+                        "kalender": (
+                            calendar_uri_el.text.strip()
+                            if calendar_uri_el is not None and calendar_uri_el.text
+                            else None
+                        ),
+                        "geloescht_am": _parse_deleted_at(
+                            deleted_el.text if deleted_el is not None else None
+                        ),
+                    }
+                )
+            return items
+
+    def restore_from_trash(self, trash_id: str) -> None:
+        """Restore a deleted calendar object from the trash bin to its original calendar.
+
+        MOVEs the trashbin entry from `.../trashbin/objects/<trash_id>` to
+        `.../trashbin/restore/<trash_id>`; Nextcloud's server restores it to
+        its original calendar as a side effect of that move, not this method.
+        """
+        if not trash_id or not trash_id.strip():
+            raise TaskMcpError("id is required to restore an item from the trash bin.")
+
+        with self._lock:
+            source = self._trashbin_objects_url().join(trash_id)
+            destination = self._trashbin_restore_url().join(trash_id)
+            response = self._dav_request(
+                source,
+                "MOVE",
+                "",
+                {"Destination": str(destination)},
+                forbidden_message=(
+                    f"Nextcloud denied restoring trash item '{trash_id}' (permission denied)."
+                ),
+            )
+            if response.status == 404:
+                raise TaskMcpError(f"Trash item '{trash_id}' was not found in the trash bin.")
+            if response.status == 405:
+                raise TaskMcpError("The trash bin is not available on this server.")
+            if response.status not in (200, 201, 204):
+                logger.warning(
+                    "Unexpected trashbin restore response %s for %s", response.status, trash_id
+                )
+                raise TaskMcpError(
+                    f"Nextcloud rejected restoring trash item '{trash_id}' "
+                    f"(HTTP {response.status})."
+                )
+
+    # ------------------------------------------------------------------
+    # ICS import / export
+    # ------------------------------------------------------------------
+
+    def export_calendar(self, kalender_name: str) -> dict[str, str]:
+        """Export a task list or event calendar as a single ICS (VCALENDAR) text.
+
+        Built client-side for portability: every object in the collection
+        (`calendar.events()` / `calendar.todos()`, whichever the collection
+        supports) is fetched, and its components (including any VTIMEZONEs
+        and, for a recurring event/task, its override instances - these
+        already live together in one calendar object) are merged into one
+        VCALENDAR with a single PRODID/VERSION header. VTIMEZONE components
+        are de-duplicated by TZID.
+        """
+        with self._lock:
+            calendar = self._resolve_collection_any(kalender_name)
+
+            try:
+                events = (
+                    calendar.events() if self._supports_component(calendar, "VEVENT") else []
+                )
+                todos = (
+                    calendar.todos(include_completed=True)
+                    if self._supports_component(calendar, "VTODO")
+                    else []
+                )
+            except caldav_error.NotFoundError as exc:
+                raise TaskMcpError(
+                    f"Calendar or task list '{kalender_name}' was not found."
+                ) from exc
+            except Exception as exc:
+                raise _translate(exc) from exc
+
+            merged = Calendar()
+            merged.add("prodid", "-//nextcloud-task-mcp//EN")
+            merged.add("version", "2.0")
+            seen_tzids: set[str] = set()
+            for obj in list(events) + list(todos):
+                try:
+                    instance = obj.icalendar_instance
+                except Exception as exc:
+                    raise _translate(exc) from exc
+                for component in instance.subcomponents:
+                    if component.name == "VTIMEZONE":
+                        tzid = str(component.get("TZID", ""))
+                        if tzid:
+                            if tzid in seen_tzids:
+                                continue
+                            seen_tzids.add(tzid)
+                    merged.add_component(component)
+
+            return {"kalender_name": kalender_name, "ics": merged.to_ical().decode("utf-8")}
+
+    def import_ics(self, kalender_name: str, ics: str) -> dict[str, Any]:
+        """Import ICS text into a task list or event calendar.
+
+        Top-level VEVENT/VTODO components are grouped by UID (so a recurring
+        event/task and its override instances stay together as ONE saved
+        calendar object, along with any VTIMEZONEs from the source ICS), then
+        each group is saved via `calendar.save_event`/`calendar.save_todo`.
+        A group whose kind (VEVENT/VTODO) the target collection doesn't
+        support is skipped rather than failing the whole import.
+        """
+        if not ics or not ics.strip():
+            raise InvalidIcsDataError("ics is required and must not be empty.")
+        try:
+            parsed = Calendar.from_ical(ics)
+        except Exception as exc:
+            raise InvalidIcsDataError(f"Could not parse ics: {exc}") from exc
+        if getattr(parsed, "name", None) != "VCALENDAR":
+            raise InvalidIcsDataError("ics must be a VCALENDAR.")
+
+        timezones = [c for c in parsed.subcomponents if c.name == "VTIMEZONE"]
+        groups: dict[tuple[str, str], list[Any]] = {}
+        for component in parsed.subcomponents:
+            if component.name not in ("VEVENT", "VTODO"):
+                continue
+            uid = str(component.get("UID") or uuid.uuid4())
+            groups.setdefault((uid, component.name), []).append(component)
+
+        if not groups:
+            raise InvalidIcsDataError("ics must contain at least one VEVENT or VTODO component.")
+
+        with self._lock:
+            calendar = self._resolve_collection_any(kalender_name)
+
+            importiert = 0
+            uebersprungen = 0
+            for (_uid, kind), components in groups.items():
+                if not self._supports_component(calendar, kind):
+                    uebersprungen += 1
+                    continue
+
+                sub_calendar = Calendar()
+                sub_calendar.add("prodid", "-//nextcloud-task-mcp//EN")
+                sub_calendar.add("version", "2.0")
+                for tz in timezones:
+                    sub_calendar.add_component(tz)
+                for component in components:
+                    sub_calendar.add_component(component)
+                ical_text = sub_calendar.to_ical().decode("utf-8")
+
+                try:
+                    if kind == "VEVENT":
+                        calendar.save_event(ical=ical_text)
+                    else:
+                        calendar.save_todo(ical=ical_text)
+                except TaskMcpError:
+                    raise
+                except Exception as exc:
+                    raise _translate(exc) from exc
+                importiert += 1
+
+        return {
+            "kalender_name": kalender_name,
+            "importiert": importiert,
+            "uebersprungen": uebersprungen,
+        }

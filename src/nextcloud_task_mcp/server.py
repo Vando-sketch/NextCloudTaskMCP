@@ -839,6 +839,143 @@ def build_server(settings: Settings, service: CalDavService | None = None) -> Fa
         """
         return await _call(caldav_service.get_free_busy, von, bis, benutzer)
 
+    @mcp.tool
+    async def share_calendar(
+        kalender_name: str,
+        empfaenger: str,
+        gruppe: bool = False,
+        schreibzugriff: bool = False,
+    ) -> dict[str, Any]:
+        """Share a task list or event calendar with a Nextcloud user or group.
+
+        Uses Nextcloud's own CalDAV sharing extension - this only works
+        against a real Nextcloud server, not a generic CalDAV server, since
+        it isn't part of any CalDAV RFC. Calling this again for the same
+        empfaenger updates their access level instead of creating a
+        duplicate share.
+
+        Args:
+            kalender_name: Display name of the task list or event calendar
+                to share (resolved across both kinds).
+            empfaenger: Nextcloud user id (or group id when gruppe=True) to
+                share with.
+            gruppe: If True, empfaenger names a group instead of a user.
+            schreibzugriff: If True, grant read-write access; otherwise the
+                share is read-only.
+
+        Returns:
+            {"kalender_name", "empfaenger", "schreibzugriff"} on success.
+        """
+        return await _call(
+            caldav_service.share_calendar, kalender_name, empfaenger, gruppe, schreibzugriff
+        )
+
+    @mcp.tool
+    async def unshare_calendar(
+        kalender_name: str,
+        empfaenger: str,
+        gruppe: bool = False,
+    ) -> dict[str, str]:
+        """Remove a user's or group's share of a task list or event calendar.
+
+        A no-op (not an error) if empfaenger doesn't currently have a share
+        of this calendar.
+
+        Args:
+            kalender_name: Display name of the task list or event calendar.
+            empfaenger: Nextcloud user id (or group id when gruppe=True) to
+                unshare from.
+            gruppe: If True, empfaenger names a group instead of a user.
+
+        Returns:
+            {"kalender_name", "empfaenger"} on success.
+        """
+        await _call(caldav_service.unshare_calendar, kalender_name, empfaenger, gruppe)
+        return {"kalender_name": kalender_name, "empfaenger": empfaenger}
+
+    @mcp.tool
+    async def list_calendar_shares(kalender_name: str) -> list[dict[str, Any]]:
+        """List everyone a task list or event calendar is currently shared with.
+
+        Args:
+            kalender_name: Display name of the task list or event calendar.
+
+        Returns:
+            A list of {"empfaenger": user/group id, "typ": "benutzer" or
+            "gruppe", "schreibzugriff": bool, "status": invite status, e.g.
+            "akzeptiert"/"ausstehend"/"abgelehnt" (an unrecognized raw status
+            from the server comes back lowercased instead of being dropped)}
+            dicts.
+        """
+        return await _call(caldav_service.list_calendar_shares, kalender_name)
+
+    @mcp.tool
+    async def list_trash() -> list[dict[str, Any]]:
+        """List deleted tasks/events in Nextcloud's calendar trash bin.
+
+        Uses Nextcloud's calendar-trashbin DAV plugin; on a server without
+        it, this fails with a clean "trash bin not available" error instead
+        of a raw HTTP error.
+
+        Returns:
+            A list of {"id": trash item id (pass to restore_from_trash),
+            "titel": title if derivable from the item's data or None,
+            "typ": "aufgabe"/"termin"/None, "kalender": the original
+            calendar's URI if reported by the server or None, "geloescht_am":
+            ISO 8601 deletion timestamp or None} dicts.
+        """
+        return await _call(caldav_service.list_trash)
+
+    @mcp.tool
+    async def restore_from_trash(id: str) -> dict[str, str]:
+        """Restore a deleted task/event from the trash bin to its original calendar.
+
+        Args:
+            id: Trash item id, as returned by list_trash's "id" field.
+
+        Returns:
+            {"id": id} on success.
+        """
+        await _call(caldav_service.restore_from_trash, id)
+        return {"id": id}
+
+    @mcp.tool
+    async def export_calendar(kalender_name: str) -> dict[str, str]:
+        """Export a task list or event calendar as a single ICS (VCALENDAR) text.
+
+        Args:
+            kalender_name: Display name of the task list or event calendar
+                to export (resolved across both kinds).
+
+        Returns:
+            {"kalender_name", "ics": the full VCALENDAR text, containing
+            every task/event in the calendar}.
+        """
+        return await _call(caldav_service.export_calendar, kalender_name)
+
+    @mcp.tool
+    async def import_ics(kalender_name: str, ics: str) -> dict[str, Any]:
+        """Import ICS (VCALENDAR) text into an existing task list or event calendar.
+
+        Top-level VEVENT/VTODO components are grouped by UID, so a recurring
+        event/task and its override instances are saved together as one
+        calendar object. A component whose kind (event/task) the target
+        calendar doesn't support is skipped rather than failing the whole
+        import.
+
+        Args:
+            kalender_name: Display name of the target task list or event
+                calendar (resolved across both kinds).
+            ics: Full ICS text; must be a VCALENDAR containing at least one
+                VEVENT or VTODO.
+
+        Returns:
+            {"kalender_name", "importiert": number of calendar objects
+            created, "uebersprungen": number skipped because the target
+            calendar doesn't support that component kind}.
+        """
+        return await _call(caldav_service.import_ics, kalender_name, ics)
+
     return mcp
 
 

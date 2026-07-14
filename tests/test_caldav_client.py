@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from caldav.elements import dav
 from caldav.lib import error as caldav_error
-from icalendar import Event, FreeBusy, Todo
+from caldav.lib.url import URL
+from icalendar import Calendar, Event, FreeBusy, Todo
+from lxml import etree
 
 from nextcloud_task_mcp import caldav_client as caldav_client_module
 from nextcloud_task_mcp import event_mapping, mapping
@@ -21,6 +25,7 @@ from nextcloud_task_mcp.errors import (
     ConnectionFailedError,
     EventNotFoundError,
     InvalidEventDataError,
+    InvalidIcsDataError,
     InvalidTaskDataError,
     TaskConflictError,
     TaskListAlreadyExistsError,
@@ -1868,3 +1873,705 @@ def test_translate_rate_limit_error_names_waiting_as_fix():
     assert "retry" in str(translated).lower()
     # The raw URL/exception text must not leak into the client-facing message.
     assert "https://x/" not in str(translated)
+
+
+# ======================================================================
+# Calendar sharing (Nextcloud DAV extension)
+# ======================================================================
+
+
+def _dav_response(status: int, xml: str | None = None) -> SimpleNamespace:
+    """A stand-in for `caldav.response.DAVResponse` - `_dav_request`'s callers
+    only ever look at `.status` and `.tree`."""
+    tree = etree.fromstring(xml.encode("utf-8")) if xml else None
+    return SimpleNamespace(status=status, tree=tree)
+
+
+@pytest.fixture
+def dav_client(service, mock_dav_client) -> MagicMock:
+    """`service._client` itself, with a real `.url` set (the mock's default
+    auto-generated attribute doesn't behave like a caldav URL object, but
+    `_trashbin_objects_url`/`_trashbin_restore_url` need `.join()` on it)."""
+    client = mock_dav_client.return_value
+    client.url = URL.objectify("https://cloud.example.com/dav/")
+    return client
+
+
+_INVITE_XML = """<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/u/privat/</d:href>
+    <d:propstat>
+      <d:prop>
+        <oc:invite>
+          <oc:user>
+            <d:href>principal:principals/users/bob</d:href>
+            <oc:common-name>Bob</oc:common-name>
+            <oc:invite-accepted/>
+            <oc:access><oc:read-write/></oc:access>
+          </oc:user>
+          <oc:user>
+            <d:href>principal:principals/groups/team</d:href>
+            <oc:invite-noresponse/>
+            <oc:access><oc:read/></oc:access>
+          </oc:user>
+          <oc:organizer>
+            <d:href>principal:principals/users/owner</d:href>
+          </oc:organizer>
+        </oc:invite>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>
+"""
+
+
+def test_share_calendar_posts_share_xml_with_read_write(service, principal, dav_client):
+    calendar = _make_calendar(
+        "Privat", "https://cloud.example.com/dav/privat/", components=["VEVENT"]
+    )
+    principal.calendars.return_value = [calendar]
+    dav_client.request.return_value = _dav_response(200)
+
+    result = service.share_calendar("Privat", "bob", schreibzugriff=True)
+
+    assert result == {"kalender_name": "Privat", "empfaenger": "bob", "schreibzugriff": True}
+    args, _ = dav_client.request.call_args
+    url, method, body, headers = args
+    assert url == "https://cloud.example.com/dav/privat/"
+    assert method == "POST"
+    assert headers["Content-Type"].startswith("application/xml")
+    tree = etree.fromstring(body.encode("utf-8"))
+    assert tree.find(".//{DAV:}href").text == "principal:principals/users/bob"
+    assert tree.find(".//{http://owncloud.org/ns}read-write") is not None
+    assert tree.find(".//{http://owncloud.org/ns}set") is not None
+
+
+def test_share_calendar_read_only_omits_read_write_element(service, principal, dav_client):
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    dav_client.request.return_value = _dav_response(200)
+
+    service.share_calendar("Privat", "bob")
+
+    args, _ = dav_client.request.call_args
+    tree = etree.fromstring(args[2].encode("utf-8"))
+    assert tree.find(".//{http://owncloud.org/ns}read-write") is None
+
+
+def test_share_calendar_group_uses_groups_principal_href(service, principal, dav_client):
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    dav_client.request.return_value = _dav_response(200)
+
+    service.share_calendar("Privat", "team", gruppe=True)
+
+    args, _ = dav_client.request.call_args
+    tree = etree.fromstring(args[2].encode("utf-8"))
+    assert tree.find(".//{DAV:}href").text == "principal:principals/groups/team"
+
+
+def test_share_calendar_resolves_task_lists_too(service, principal, dav_client):
+    calendar = _make_calendar("Aufgaben", components=["VTODO"])
+    principal.calendars.return_value = [calendar]
+    dav_client.request.return_value = _dav_response(200)
+
+    result = service.share_calendar("Aufgaben", "bob")
+
+    assert result["kalender_name"] == "Aufgaben"
+
+
+def test_share_calendar_requires_empfaenger(service, principal, dav_client):
+    with pytest.raises(TaskMcpError, match="empfaenger is required"):
+        service.share_calendar("Privat", "")
+
+
+def test_share_calendar_not_found_across_both_kinds(service, principal, dav_client):
+    principal.calendars.return_value = []
+
+    with pytest.raises(TaskMcpError, match="was not found"):
+        service.share_calendar("Ghost", "bob")
+
+
+def test_share_calendar_unknown_recipient_404_raises_clean_error(service, principal, dav_client):
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    dav_client.request.return_value = _dav_response(404)
+
+    with pytest.raises(TaskMcpError, match="could not find user/group 'ghost'"):
+        service.share_calendar("Privat", "ghost")
+
+
+def test_share_calendar_forbidden_raises_clean_permission_error(service, principal, dav_client):
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    dav_client.request.side_effect = caldav_error.AuthorizationError("403 Forbidden")
+
+    with pytest.raises(TaskMcpError, match="permission denied"):
+        service.share_calendar("Privat", "bob")
+
+
+def test_share_calendar_unexpected_status_raises_clean_error(service, principal, dav_client):
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    dav_client.request.return_value = _dav_response(500)
+
+    with pytest.raises(TaskMcpError, match="HTTP 500"):
+        service.share_calendar("Privat", "bob")
+
+
+def test_share_calendar_invalid_request_400_raises_clean_error(service, principal, dav_client):
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    dav_client.request.return_value = _dav_response(400)
+
+    with pytest.raises(TaskMcpError, match="invalid"):
+        service.share_calendar("Privat", "not a valid id!!")
+
+
+def test_unshare_calendar_posts_remove_xml(service, principal, dav_client):
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    dav_client.request.return_value = _dav_response(200)
+
+    service.unshare_calendar("Privat", "bob")
+
+    args, _ = dav_client.request.call_args
+    tree = etree.fromstring(args[2].encode("utf-8"))
+    assert tree.find(".//{http://owncloud.org/ns}remove") is not None
+    assert tree.find(".//{DAV:}href").text == "principal:principals/users/bob"
+    # A remove element carries no access/summary children.
+    assert tree.find(".//{http://owncloud.org/ns}read-write") is None
+
+
+def test_unshare_calendar_requires_empfaenger(service, principal, dav_client):
+    with pytest.raises(TaskMcpError, match="empfaenger is required"):
+        service.unshare_calendar("Privat", "")
+
+
+def test_list_calendar_shares_parses_users_and_groups(service, principal, dav_client):
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    dav_client.request.return_value = _dav_response(207, _INVITE_XML)
+
+    result = service.list_calendar_shares("Privat")
+
+    assert result == [
+        {"empfaenger": "bob", "typ": "benutzer", "schreibzugriff": True, "status": "akzeptiert"},
+        {"empfaenger": "team", "typ": "gruppe", "schreibzugriff": False, "status": "ausstehend"},
+    ]
+
+
+def test_list_calendar_shares_unknown_invite_status_falls_back_to_raw_lowercase(
+    service, principal, dav_client
+):
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/u/privat/</d:href>
+    <d:propstat>
+      <d:prop>
+        <oc:invite>
+          <oc:user>
+            <d:href>principal:principals/users/bob</d:href>
+            <oc:invite-mystery/>
+            <oc:access><oc:read/></oc:access>
+          </oc:user>
+        </oc:invite>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>
+"""
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    dav_client.request.return_value = _dav_response(207, xml)
+
+    result = service.list_calendar_shares("Privat")
+
+    assert result == [
+        {"empfaenger": "bob", "typ": "benutzer", "schreibzugriff": False, "status": "mystery"}
+    ]
+
+
+def test_list_calendar_shares_no_invitees_returns_empty_list(service, principal, dav_client):
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/u/privat/</d:href>
+    <d:propstat>
+      <d:prop><oc:invite/></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>
+"""
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    dav_client.request.return_value = _dav_response(207, xml)
+
+    assert service.list_calendar_shares("Privat") == []
+
+
+def test_list_calendar_shares_unexpected_status_raises_clean_error(service, principal, dav_client):
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    dav_client.request.return_value = _dav_response(500)
+
+    with pytest.raises(TaskMcpError, match="unexpected error"):
+        service.list_calendar_shares("Privat")
+
+
+# ======================================================================
+# Trash bin (Nextcloud calendar-trashbin DAV plugin)
+# ======================================================================
+
+
+_TRASHED_TODO_ICS = (
+    "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VTODO\nUID:t1\nSUMMARY:Einkaufen\n"
+    "END:VTODO\nEND:VCALENDAR\n"
+)
+
+_TRASHBIN_XML = f"""<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:nc="http://nextcloud.com/ns">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/u/trashbin/objects/</d:href>
+    <d:propstat>
+      <d:prop/>
+      <d:status>HTTP/1.1 404 Not Found</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/calendars/u/trashbin/objects/42.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <nc:deleted-at>1752000000</nc:deleted-at>
+        <nc:calendar-uri>personal</nc:calendar-uri>
+        <c:calendar-data>{_TRASHED_TODO_ICS}</c:calendar-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>
+"""
+
+
+def test_list_trash_parses_items_including_deleted_at_and_type(service, dav_client):
+    dav_client.request.return_value = _dav_response(207, _TRASHBIN_XML)
+
+    result = service.list_trash()
+
+    assert result == [
+        {
+            "id": "42.ics",
+            "titel": "Einkaufen",
+            "typ": "aufgabe",
+            "kalender": "personal",
+            "geloescht_am": datetime.fromtimestamp(1752000000, tz=timezone.utc).isoformat(),
+        }
+    ]
+    args, _ = dav_client.request.call_args
+    url, method, _, headers = args
+    assert url == "https://cloud.example.com/dav/calendars/u/trashbin/objects/"
+    assert method == "PROPFIND"
+    assert headers["Depth"] == "1"
+
+
+def test_list_trash_missing_props_default_to_none(service, dav_client):
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:nc="http://nextcloud.com/ns">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/u/trashbin/objects/7.ics</d:href>
+    <d:propstat>
+      <d:prop/>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>
+"""
+    dav_client.request.return_value = _dav_response(207, xml)
+
+    result = service.list_trash()
+
+    assert result == [
+        {"id": "7.ics", "titel": None, "typ": None, "kalender": None, "geloescht_am": None}
+    ]
+
+
+def test_list_trash_falls_back_to_displayname_when_no_calendar_data(service, dav_client):
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:nc="http://nextcloud.com/ns">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/u/trashbin/objects/8.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Einkaufen (trashed)</d:displayname>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>
+"""
+    dav_client.request.return_value = _dav_response(207, xml)
+
+    result = service.list_trash()
+
+    assert result[0]["titel"] == "Einkaufen (trashed)"
+    assert result[0]["typ"] is None
+
+
+def test_list_trash_deleted_at_accepts_iso8601_too(service, dav_client):
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:nc="http://nextcloud.com/ns">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/u/trashbin/objects/9.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <nc:deleted-at>2026-07-10T12:00:00+00:00</nc:deleted-at>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>
+"""
+    dav_client.request.return_value = _dav_response(207, xml)
+
+    result = service.list_trash()
+
+    assert result[0]["geloescht_am"] == "2026-07-10T12:00:00+00:00"
+
+
+def test_list_trash_not_available_translates_404_to_clean_error(service, dav_client):
+    dav_client.request.return_value = _dav_response(404)
+
+    with pytest.raises(TaskMcpError, match="not available on this server"):
+        service.list_trash()
+
+
+def test_list_trash_405_also_translates_to_not_available(service, dav_client):
+    dav_client.request.return_value = _dav_response(405)
+
+    with pytest.raises(TaskMcpError, match="not available on this server"):
+        service.list_trash()
+
+
+def test_list_trash_unexpected_status_raises_clean_error(service, dav_client):
+    dav_client.request.return_value = _dav_response(500)
+
+    with pytest.raises(TaskMcpError, match="unexpected error"):
+        service.list_trash()
+
+
+def test_restore_from_trash_moves_with_destination_header(service, dav_client):
+    dav_client.request.return_value = _dav_response(204)
+
+    result = service.restore_from_trash("42.ics")
+
+    assert result is None
+    args, _ = dav_client.request.call_args
+    url, method, _, headers = args
+    assert url == "https://cloud.example.com/dav/calendars/u/trashbin/objects/42.ics"
+    assert method == "MOVE"
+    assert (
+        headers["Destination"]
+        == "https://cloud.example.com/dav/calendars/u/trashbin/restore/42.ics"
+    )
+
+
+def test_restore_from_trash_not_found_raises_clean_error(service, dav_client):
+    dav_client.request.return_value = _dav_response(404)
+
+    with pytest.raises(TaskMcpError, match="was not found in the trash bin"):
+        service.restore_from_trash("999.ics")
+
+
+def test_restore_from_trash_not_available_translates_405(service, dav_client):
+    dav_client.request.return_value = _dav_response(405)
+
+    with pytest.raises(TaskMcpError, match="not available on this server"):
+        service.restore_from_trash("42.ics")
+
+
+def test_restore_from_trash_unexpected_status_raises_clean_error(service, dav_client):
+    dav_client.request.return_value = _dav_response(500)
+
+    with pytest.raises(TaskMcpError, match="HTTP 500"):
+        service.restore_from_trash("42.ics")
+
+
+def test_restore_from_trash_requires_id(service, dav_client):
+    with pytest.raises(TaskMcpError, match="id is required"):
+        service.restore_from_trash("")
+
+
+# ======================================================================
+# ICS import / export
+# ======================================================================
+
+
+def _make_calendar_obj(instance: Calendar) -> MagicMock:
+    """A MagicMock standing in for a caldav CalendarObjectResource whose
+    `icalendar_instance` is the full VCALENDAR (event/todo + any VTIMEZONEs
+    and recurrence overrides sharing its URL), matching what the real caldav
+    library returns for `.events()`/`.todos()` entries."""
+    obj = MagicMock()
+    obj.icalendar_instance = instance
+    return obj
+
+
+def _wrap_in_vcalendar(*components: Any) -> Calendar:
+    cal = Calendar()
+    cal.add("prodid", "-//test//")
+    cal.add("version", "2.0")
+    for component in components:
+        cal.add_component(component)
+    return cal
+
+
+_ICS_WITH_TZ = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//
+BEGIN:VTIMEZONE
+TZID:Europe/Berlin
+BEGIN:STANDARD
+DTSTART:19701025T030000
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:{uid}
+SUMMARY:{summary}
+DTSTART;TZID=Europe/Berlin:20260720T140000
+DTEND;TZID=Europe/Berlin:20260720T150000
+END:VEVENT
+END:VCALENDAR
+"""
+
+
+def test_export_calendar_merges_events_and_todos_into_one_vcalendar(service, principal):
+    calendar = _make_calendar("Privat", components=["VEVENT", "VTODO"])
+    principal.calendars.return_value = [calendar]
+
+    event = _make_vevent("event-1", "Meeting")
+    todo = Todo()
+    todo.add("uid", "task-1")
+    todo.add("summary", "Einkaufen")
+    calendar.events.return_value = [_make_calendar_obj(_wrap_in_vcalendar(event))]
+    calendar.todos.return_value = [_make_calendar_obj(_wrap_in_vcalendar(todo))]
+
+    result = service.export_calendar("Privat")
+
+    assert result["kalender_name"] == "Privat"
+    parsed = Calendar.from_ical(result["ics"])
+    assert parsed.name == "VCALENDAR"
+    assert str(parsed.get("version")) == "2.0"
+    kinds = sorted(c.name for c in parsed.subcomponents)
+    assert kinds == ["VEVENT", "VTODO"]
+    calendar.todos.assert_called_once_with(include_completed=True)
+
+
+def test_export_calendar_only_queries_supported_components(service, principal):
+    calendar = _make_calendar("Aufgaben", components=["VTODO"])
+    principal.calendars.return_value = [calendar]
+    todo = Todo()
+    todo.add("uid", "task-1")
+    todo.add("summary", "Einkaufen")
+    calendar.todos.return_value = [_make_calendar_obj(_wrap_in_vcalendar(todo))]
+
+    result = service.export_calendar("Aufgaben")
+
+    calendar.events.assert_not_called()
+    parsed = Calendar.from_ical(result["ics"])
+    assert [c.name for c in parsed.subcomponents] == ["VTODO"]
+
+
+def test_export_calendar_dedups_vtimezone_by_tzid(service, principal):
+    calendar = _make_calendar("Termine", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    calendar.events.return_value = [
+        _make_calendar_obj(Calendar.from_ical(_ICS_WITH_TZ.format(uid="e1", summary="Eins"))),
+        _make_calendar_obj(Calendar.from_ical(_ICS_WITH_TZ.format(uid="e2", summary="Zwei"))),
+    ]
+    calendar.todos.return_value = []
+
+    result = service.export_calendar("Termine")
+
+    parsed = Calendar.from_ical(result["ics"])
+    tz_components = [c for c in parsed.subcomponents if c.name == "VTIMEZONE"]
+    event_components = [c for c in parsed.subcomponents if c.name == "VEVENT"]
+    assert len(tz_components) == 1
+    assert len(event_components) == 2
+
+
+def test_export_calendar_not_found_across_both_kinds(service, principal):
+    principal.calendars.return_value = []
+
+    with pytest.raises(TaskMcpError, match="was not found"):
+        service.export_calendar("Ghost")
+
+
+def test_export_calendar_events_not_found_becomes_clean_error(service, principal):
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    calendar.events.side_effect = caldav_error.NotFoundError("gone")
+
+    with pytest.raises(TaskMcpError, match="was not found"):
+        service.export_calendar("Privat")
+
+
+def test_export_calendar_unexpected_error_is_translated(service, principal):
+    calendar = _make_calendar("Privat", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    calendar.events.side_effect = RuntimeError("boom")
+
+    with pytest.raises(TaskMcpError):
+        service.export_calendar("Privat")
+
+
+def test_import_ics_saves_one_calendar_object_with_its_timezone(service, principal):
+    calendar = _make_calendar("Termine", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+
+    result = service.import_ics("Termine", _ICS_WITH_TZ.format(uid="e1", summary="Eins"))
+
+    assert result == {"kalender_name": "Termine", "importiert": 1, "uebersprungen": 0}
+    calendar.save_event.assert_called_once()
+    _, kwargs = calendar.save_event.call_args
+    assert "BEGIN:VEVENT" in kwargs["ical"]
+    assert "BEGIN:VTIMEZONE" in kwargs["ical"]
+
+
+def test_import_ics_recurring_overrides_share_one_calendar_object(service, principal):
+    calendar = _make_calendar("Termine", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    ics = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//
+BEGIN:VEVENT
+UID:series-1
+SUMMARY:Weekly
+DTSTART:20260720T140000Z
+RRULE:FREQ=WEEKLY
+END:VEVENT
+BEGIN:VEVENT
+UID:series-1
+SUMMARY:Weekly (moved)
+DTSTART:20260727T160000Z
+RECURRENCE-ID:20260727T140000Z
+END:VEVENT
+END:VCALENDAR
+"""
+
+    result = service.import_ics("Termine", ics)
+
+    assert result == {"kalender_name": "Termine", "importiert": 1, "uebersprungen": 0}
+    calendar.save_event.assert_called_once()
+    _, kwargs = calendar.save_event.call_args
+    assert kwargs["ical"].count("BEGIN:VEVENT") == 2
+
+
+def test_import_ics_skips_unsupported_component_kind(service, principal):
+    calendar = _make_calendar("Termine", components=["VEVENT"])  # no VTODO support
+    principal.calendars.return_value = [calendar]
+    ics = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//
+BEGIN:VTODO
+UID:task-1
+SUMMARY:Einkaufen
+END:VTODO
+END:VCALENDAR
+"""
+
+    result = service.import_ics("Termine", ics)
+
+    assert result == {"kalender_name": "Termine", "importiert": 0, "uebersprungen": 1}
+    calendar.save_event.assert_not_called()
+    calendar.save_todo.assert_not_called()
+
+
+def test_import_ics_mixed_kinds_partially_skipped(service, principal):
+    calendar = _make_calendar("Termine", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    ics = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//
+BEGIN:VEVENT
+UID:e1
+SUMMARY:Meeting
+DTSTART:20260720T140000Z
+END:VEVENT
+BEGIN:VTODO
+UID:t1
+SUMMARY:Einkaufen
+END:VTODO
+END:VCALENDAR
+"""
+
+    result = service.import_ics("Termine", ics)
+
+    assert result == {"kalender_name": "Termine", "importiert": 1, "uebersprungen": 1}
+    calendar.save_event.assert_called_once()
+    calendar.save_todo.assert_not_called()
+
+
+def test_import_ics_saves_vtodo_into_a_task_list(service, principal):
+    calendar = _make_calendar("Aufgaben", components=["VTODO"])
+    principal.calendars.return_value = [calendar]
+    ics = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//
+BEGIN:VTODO
+UID:t1
+SUMMARY:Einkaufen
+END:VTODO
+END:VCALENDAR
+"""
+
+    result = service.import_ics("Aufgaben", ics)
+
+    assert result == {"kalender_name": "Aufgaben", "importiert": 1, "uebersprungen": 0}
+    calendar.save_todo.assert_called_once()
+    _, kwargs = calendar.save_todo.call_args
+    assert "BEGIN:VTODO" in kwargs["ical"]
+
+
+def test_import_ics_save_error_is_translated(service, principal):
+    calendar = _make_calendar("Termine", components=["VEVENT"])
+    principal.calendars.return_value = [calendar]
+    calendar.save_event.side_effect = RuntimeError("boom")
+
+    with pytest.raises(TaskMcpError):
+        service.import_ics("Termine", _ICS_WITH_TZ.format(uid="e1", summary="Eins"))
+
+
+def test_import_ics_invalid_ics_raises_clean_error_with_parse_detail(service, principal):
+    with pytest.raises(InvalidIcsDataError, match="Could not parse ics"):
+        service.import_ics("Termine", "not a valid ics at all {{{")
+
+
+def test_import_ics_requires_at_least_one_event_or_todo(service, principal):
+    ics = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Test//\nEND:VCALENDAR\n"
+
+    with pytest.raises(InvalidIcsDataError, match="at least one VEVENT or VTODO"):
+        service.import_ics("Termine", ics)
+
+
+def test_import_ics_rejects_non_vcalendar_top_level(service, principal):
+    with pytest.raises(InvalidIcsDataError, match="VCALENDAR"):
+        service.import_ics("Termine", "BEGIN:VEVENT\nUID:x\nEND:VEVENT\n")
+
+
+def test_import_ics_empty_string_raises_clean_error(service, principal):
+    with pytest.raises(InvalidIcsDataError, match="required"):
+        service.import_ics("Termine", "")
+
+
+def test_import_ics_calendar_not_found_across_both_kinds(service, principal):
+    principal.calendars.return_value = []
+
+    with pytest.raises(TaskMcpError, match="was not found"):
+        service.import_ics("Ghost", _ICS_WITH_TZ.format(uid="e1", summary="Eins"))
