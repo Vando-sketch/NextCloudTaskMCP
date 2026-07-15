@@ -40,8 +40,8 @@ No parameters. Returns every VTODO-supporting calendar (task list) on the accoun
 
 ```json
 [
-  {"name": "Privat", "url": "https://cloud.example.com/remote.php/dav/calendars/elias/privat/"},
-  {"name": "Arbeit", "url": "https://cloud.example.com/remote.php/dav/calendars/elias/arbeit/"}
+  {"name": "Privat", "url": "https://cloud.example.com/remote.php/dav/calendars/demo/privat/"},
+  {"name": "Arbeit", "url": "https://cloud.example.com/remote.php/dav/calendars/demo/arbeit/"}
 ]
 ```
 
@@ -272,7 +272,7 @@ No parameters. Returns every VEVENT-supporting calendar:
 [
   {
     "name": "Personal",
-    "url": "https://cloud.example.com/remote.php/dav/calendars/elias/personal/",
+    "url": "https://cloud.example.com/remote.php/dav/calendars/demo/personal/",
     "farbe": "#00679e",
     "komponenten": ["VEVENT"]
   }

@@ -2368,7 +2368,7 @@ def test_export_calendar_merges_events_and_todos_into_one_vcalendar(service, pri
     parsed = Calendar.from_ical(result["ics"])
     assert parsed.name == "VCALENDAR"
     assert str(parsed.get("version")) == "2.0"
-    kinds = sorted(c.name for c in parsed.subcomponents)
+    kinds = sorted(str(c.name) for c in parsed.subcomponents)
     assert kinds == ["VEVENT", "VTODO"]
     calendar.todos.assert_called_once_with(include_completed=True)
 
